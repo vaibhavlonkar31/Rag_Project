@@ -1,0 +1,6 @@
+/* scripts/ui/styles.css */
+.chat-bubble {
+  border-radius: 12px;
+  padding: 8px 12px;
+  margin: 6px 0;
+}

@@ -4,58 +4,56 @@ import streamlit as st
 
 
 def render_citations(chunks: list):
-    """Render retrieved chunks as collapsible source cards. UUIDs hidden."""
+    """Render retrieved document chunks as clean expandable source cards."""
     if not chunks:
         return
 
-    st.markdown("""
-    <p style="
-        font-family:'JetBrains Mono',monospace;
-        font-size:0.65rem; font-weight:500;
-        color:rgba(240,238,255,0.25);
-        letter-spacing:0.1em; text-transform:uppercase;
-        margin: 0.2rem 0 0.5rem 0.1rem;
-    ">▸ Source Excerpts</p>
+    valid = []
+    for c in chunks:
+        text = c.get("text", "") if isinstance(c, dict) else str(c)
+        text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\t ").strip()
+        if text:
+            valid.append((c, text))
+
+    if not valid:
+        return
+
+    st.markdown(f"""
+    <div style="margin-top:.3rem;animation:fadeIn .5s .3s ease both;
+                opacity:0;animation-fill-mode:forwards;">
+        <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.6rem;">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:.63rem;
+                         color:rgba(240,238,255,.28);letter-spacing:.1em;text-transform:uppercase;">
+                📎 {len(valid)} Source{'s' if len(valid)!=1 else ''}
+            </span>
+        </div>
+    </div>
     """, unsafe_allow_html=True)
 
-    for i, chunk in enumerate(chunks):
-        # Normalize — chunk can be str or dict
+    for i, (chunk, text) in enumerate(valid):
         if isinstance(chunk, dict):
-            text   = chunk.get("text", "")
-            source = chunk.get("source_file") or chunk.get("source") or chunk.get("title", "")
-            score  = chunk.get("final_score") or chunk.get("score")
+            source = chunk.get("source_file", chunk.get("title", f"Source {i+1}"))
+            score  = chunk.get("final_score", chunk.get("score"))
         else:
-            text   = str(chunk)
-            source = ""
+            source = f"Source {i + 1}"
             score  = None
 
-        # Clean text
-        text = "".join(c for c in text if c.isprintable() or c in "\n\t ").strip()
-
-        # Build label — use source filename, not UUID
-        label_parts = [f"Source {i + 1}"]
-        if source:
-            label_parts.append(source)
+        score_html = ""
         if score is not None:
-            pct = int(float(score) * 100)
-            label_parts.append(f"{pct}% match")
-        label = " · ".join(label_parts)
+            pct   = int(float(score) * 100)
+            color = "#00e5c0" if pct >= 60 else "#ff6f91" if pct < 35 else "#7c6fff"
+            score_html = f"""
+            <span style="font-family:'JetBrains Mono',monospace;font-size:.63rem;
+                color:{color};background:rgba(0,0,0,.3);
+                border:1px solid {color}40;
+                border-radius:99px;padding:.1rem .5rem;">{pct}% match</span>"""
 
-        with st.expander(label, expanded=False):
-            if text:
-                st.markdown(f"""
-                <div style="
-                    font-family:'JetBrains Mono',monospace;
-                    font-size:0.8rem;
-                    color:rgba(240,238,255,0.6);
-                    line-height:1.75;
-                    padding:0.2rem 0;
-                    white-space:pre-wrap;
-                ">{text}</div>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown(
-                    "<em style='color:rgba(240,238,255,0.2); font-size:0.8rem;'>"
-                    "No text available.</em>",
-                    unsafe_allow_html=True,
-                )
+        with st.expander(f"📄  {source}", expanded=False):
+            st.markdown(f"""
+            <div style="font-family:'JetBrains Mono',monospace;
+                font-size:.8rem;color:rgba(240,238,255,.65);
+                line-height:1.75;padding:.3rem 0;
+                border-left:2px solid rgba(124,111,255,.3);
+                padding-left:.8rem;">{text}</div>
+            {score_html}
+            """, unsafe_allow_html=True)

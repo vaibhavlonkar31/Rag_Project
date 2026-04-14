@@ -33,8 +33,14 @@ CHUNK_SIZE = 800              # chars per chunk (sentence-aware)
 CHUNK_OVERLAP = 150           # overlap chars between chunks
 
 # ── LLM (Groq) ────────────────────────────────────────────────────────────────
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL   = "llama-3.1-8b-instant"
+# Support both Streamlit Cloud secrets and local .env
+try:
+    import streamlit as st
+    GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY", "")
+except Exception:
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 if not GROQ_API_KEY:
     raise EnvironmentError(

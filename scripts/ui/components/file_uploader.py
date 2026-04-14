@@ -1,16 +1,29 @@
 # scripts/ui/components/file_uploader.py
 
 import re
-import requests
+import sys
+import tempfile
+from pathlib import Path
+
 import streamlit as st
 
+# ── Fix import path so we can reach scripts/ from scripts/ui/components/ ──────
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent  # → scripts/
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
-def render_file_uploader(api_url: str, session: dict | None = None):
+from retriever_reranker_cache import add_file_to_rag, summarize_document
+
+
+def render_file_uploader(api_url: str = "", session: dict | None = None):
     """
     session["summaries"] stores {filename: summary_text}.
     Rule: summaries are ONLY rendered from session["summaries"].
     _explain_files() saves to session but does NOT call _render_summary_card().
     This function renders them once at the end — no duplicates ever.
+
+    NOTE: api_url is kept as a parameter for backwards compatibility but is
+    no longer used. All operations call Python functions directly.
     """
 
     st.markdown("""
@@ -51,11 +64,10 @@ def render_file_uploader(api_url: str, session: dict | None = None):
         do_both    = st.button("✨ Index + Explain",  use_container_width=True, key="btn_both")
 
     if do_index or do_both:
-        _index_files(uploaded_files, api_url)
+        _index_files(uploaded_files)
 
     if do_explain or do_both:
-        # Saves new summaries into session["summaries"] — does NOT render them here
-        _fetch_and_save_summaries(uploaded_files, api_url, session)
+        _fetch_and_save_summaries(uploaded_files, session)
 
     # ── Single render point — always exactly once per summary ─────────────────
     if session and session.get("summaries"):
@@ -64,17 +76,22 @@ def render_file_uploader(api_url: str, session: dict | None = None):
 
 
 # ── Index ──────────────────────────────────────────────────────────────────────
-def _index_files(uploaded_files, api_url: str):
+def _index_files(uploaded_files):
     success, failed = [], []
     bar = st.progress(0, text="Indexing…")
     for i, f in enumerate(uploaded_files):
         try:
-            r = requests.post(
-                f"{api_url}/upload",
-                files={"file": (f.name, f.getvalue(), f.type)},
-                timeout=120,
-            )
-            (success if r.status_code == 200 else failed).append(f.name)
+            # Save to a temp file then call add_file_to_rag directly
+            suffix = Path(f.name).suffix
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(f.getvalue())
+                tmp_path = Path(tmp.name)
+
+            add_file_to_rag(tmp_path)
+
+            # Clean up temp file
+            tmp_path.unlink(missing_ok=True)
+            success.append(f.name)
         except Exception as e:
             failed.append(f"{f.name} ({e})")
         bar.progress((i + 1) / len(uploaded_files), text=f"{i+1}/{len(uploaded_files)} indexed")
@@ -99,7 +116,7 @@ def _index_files(uploaded_files, api_url: str):
 
 
 # ── Fetch summaries and SAVE only — no rendering here ─────────────────────────
-def _fetch_and_save_summaries(uploaded_files, api_url: str, session: dict | None):
+def _fetch_and_save_summaries(uploaded_files, session: dict | None):
     if session is None:
         return
 
@@ -113,21 +130,23 @@ def _fetch_and_save_summaries(uploaded_files, api_url: str, session: dict | None
 
         with st.spinner(f"Summarising '{f.name}'…"):
             try:
-                r = requests.post(
-                    f"{api_url}/summarize",
-                    files={"file": (f.name, f.getvalue(), f.type)},
-                    timeout=180,
-                )
+                # Save to temp file then call summarize_document directly
+                suffix = Path(f.name).suffix
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(f.getvalue())
+                    tmp_path = Path(tmp.name)
+
+                summary = summarize_document(tmp_path)
+
+                # Clean up temp file
+                tmp_path.unlink(missing_ok=True)
+
             except Exception as e:
-                st.error(f"Backend error for '{f.name}': {e}")
+                st.error(f"Summarisation error for '{f.name}': {e}")
                 continue
 
-        if r.status_code != 200:
-            st.error(f"Summarisation failed for '{f.name}': {r.text}")
-            continue
-
         # Store — rendering happens once at the bottom of render_file_uploader()
-        session["summaries"][f.name] = r.json().get("summary", "No summary returned.")
+        session["summaries"][f.name] = summary or "No summary returned."
 
 
 # ── Parse helpers ──────────────────────────────────────────────────────────────

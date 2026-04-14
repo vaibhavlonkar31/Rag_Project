@@ -5,12 +5,12 @@ import uuid
 from pathlib import Path
 from datetime import datetime
 
-import requests
 import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE_DIR))
 
+from retriever_reranker_cache import phase3_pipeline
 from ui.components.chat_box import render_chat_box
 from ui.components.citations_viewer import render_citations
 from ui.components.file_uploader import render_file_uploader
@@ -21,8 +21,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
-
-BACKEND_URL = "http://127.0.0.1:8000"
 
 # ── Session defaults ───────────────────────────────────────────────────────────
 for _k, _v in {
@@ -57,8 +55,13 @@ def _new_session():
 
 def _auto_title(q):
     words = q.strip().split()
-    raw = " ".join(words[:7])
+    raw   = " ".join(words[:7])
     return (raw[:45] + "…") if len(raw) > 45 else raw
+
+def _clean_text(text: str) -> str:
+    return "".join(
+        c for c in (text or "") if c.isprintable() or c in "\n\t "
+    ).strip()
 
 if not st.session_state.sessions or _active_session() is None:
     _new_session()
@@ -292,10 +295,10 @@ sess = _active_session()
 if sess is None:
     sess = _new_session()
 
-turns = sess.get("turns", [])
+turns   = sess.get("turns", [])
 sc_info = SECTION_MAP.get(active_section, SECTION_MAP["chat"])
-sc = sc_info["color"]
-si = sc_info["icon"]
+sc      = sc_info["color"]
+si      = sc_info["icon"]
 
 # ── Top bar: logo + title + live indicator ────────────────────────────────────
 col_logo, col_title, col_live = st.columns([0.7, 5, 1])
@@ -359,7 +362,7 @@ with col_live:
 st.markdown("<div style='border-top:1px solid rgba(255,255,255,.07);margin:.45rem 0 .7rem;'></div>",
             unsafe_allow_html=True)
 
-# ── Section nav tabs (inline, no sidebar needed) ──────────────────────────────
+# ── Section nav tabs ──────────────────────────────────────────────────────────
 tab_cols = st.columns(len(SECTIONS) + 2)
 for i, sec in enumerate(SECTIONS):
     with tab_cols[i]:
@@ -389,7 +392,7 @@ st.markdown("<div style='margin:.6rem 0 .9rem;border-top:1px solid rgba(255,255,
             unsafe_allow_html=True)
 
 # ── File uploader ──────────────────────────────────────────────────────────────
-render_file_uploader(api_url=BACKEND_URL, session=sess)
+render_file_uploader(session=sess)
 st.markdown("<div style='margin:.85rem 0;border-top:1px solid rgba(255,255,255,.05);'></div>",
             unsafe_allow_html=True)
 
@@ -455,8 +458,8 @@ else:
     col_clr, _ = st.columns([1, 6])
     with col_clr:
         if st.button("🗑 Clear", key="clear_main", type="secondary"):
-            sess["turns"] = []
-            sess["title"] = "New Chat"
+            sess["turns"]     = []
+            sess["title"]     = "New Chat"
             sess["summaries"] = {}
             st.session_state.input_key += 1
             st.rerun()
@@ -485,29 +488,21 @@ if ask:
     else:
         with st.spinner("Thinking…"):
             try:
-                resp = requests.post(
-                    f"{BACKEND_URL}/query",
-                    json={"query": user_input},
-                    timeout=90,
-                )
+                result = phase3_pipeline(user_input, limit=5)
+                turn = {
+                    "user":      user_input,
+                    "answer":    result.get("llm_answer", "No answer returned."),
+                    "citations": result.get("citations", []),
+                    "chunks":    [_clean_text(c.get("text", "")) for c in result.get("chunks", [])],
+                    "mode":      result.get("mode", "rag"),
+                    "timestamp": datetime.now().strftime("%H:%M"),
+                }
             except Exception as e:
-                st.error(f"Could not reach backend: {e}")
+                st.error(f"Error: {e}")
                 st.stop()
 
-        if resp.status_code != 200:
-            st.error(f"Backend error {resp.status_code}: {resp.text}")
-        else:
-            d = resp.json()
-            turn = {
-                "user":      user_input,
-                "answer":    d.get("answer", "No answer returned."),
-                "citations": d.get("citations", []),
-                "chunks":    d.get("chunks", []),
-                "mode":      d.get("mode", "rag"),
-                "timestamp": datetime.now().strftime("%H:%M"),
-            }
-            sess["turns"].append(turn)
-            if len(sess["turns"]) == 1:
-                sess["title"] = _auto_title(user_input)
-            st.session_state.input_key += 1
-            st.rerun()
+        sess["turns"].append(turn)
+        if len(sess["turns"]) == 1:
+            sess["title"] = _auto_title(user_input)
+        st.session_state.input_key += 1
+        st.rerun()

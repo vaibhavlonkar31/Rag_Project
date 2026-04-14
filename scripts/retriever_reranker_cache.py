@@ -21,12 +21,12 @@ import docx
 from groq import Groq
 from PyPDF2 import PdfReader
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct
+from qdrant_client.models import Distance, PointStruct, VectorParams
 from sentence_transformers import SentenceTransformer
 
 from config import (
-    QDRANT_URL, COLLECTION_NAME,
-    EMBEDDER_MODEL,
+    QDRANT_URL, QDRANT_API_KEY, COLLECTION_NAME,
+    EMBEDDER_MODEL, VECTOR_SIZE,
     GROQ_API_KEY, GROQ_MODEL,
     CHUNK_SIZE, CHUNK_OVERLAP,
 )
@@ -50,9 +50,13 @@ def get_embedder() -> SentenceTransformer:
 
 
 def get_qdrant() -> QdrantClient:
+    """Connect to Qdrant Cloud if API key is set, otherwise local."""
     global _qdrant
     if _qdrant is None:
-        _qdrant = QdrantClient(url=QDRANT_URL)
+        if QDRANT_API_KEY:
+            _qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        else:
+            _qdrant = QdrantClient(url=QDRANT_URL)
     return _qdrant
 
 
@@ -61,6 +65,20 @@ def get_groq() -> Groq:
     if _groq is None:
         _groq = Groq(api_key=GROQ_API_KEY)
     return _groq
+
+
+# ── Ensure collection exists (needed for fresh Qdrant Cloud cluster) ──────────
+
+def ensure_collection() -> None:
+    """Create the Qdrant collection if it doesn't exist yet."""
+    qdrant = get_qdrant()
+    existing = [c.name for c in qdrant.get_collections().collections]
+    if COLLECTION_NAME not in existing:
+        qdrant.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+        )
+        print(f"[QDRANT] Created collection '{COLLECTION_NAME}'")
 
 
 # ── File readers ──────────────────────────────────────────────────────────────
@@ -96,12 +114,11 @@ def split_text_into_chunks(
     """
     Sentence-aware chunking: accumulate sentences until chunk_size chars,
     then start a new chunk with `overlap` chars carried over.
-    This avoids cutting mid-sentence which hurts retrieval quality.
     """
-    sentences = _split_sentences(text)
-    chunks    = []
-    chunk_id  = 0
-    current   = []
+    sentences   = _split_sentences(text)
+    chunks      = []
+    chunk_id    = 0
+    current     = []
     current_len = 0
 
     for sentence in sentences:
@@ -111,7 +128,6 @@ def split_text_into_chunks(
             chunks.append({"id": str(chunk_id), "text": chunk_text})
             chunk_id += 1
 
-            # Carry over last N chars worth of sentences for overlap
             overlap_sents = []
             overlap_len   = 0
             for s in reversed(current):
@@ -135,11 +151,8 @@ def split_text_into_chunks(
 # ── Query expansion ───────────────────────────────────────────────────────────
 
 def expand_query(query: str) -> list[str]:
-    """
-    Generate 3 alternative phrasings of the query using LLaMA.
-    Searching with multiple variants catches more relevant chunks.
-    """
-    groq = get_groq()
+    """Generate 3 alternative phrasings of the query using LLaMA."""
+    groq   = get_groq()
     prompt = (
         "Rewrite the following search query into 3 different alternative phrasings "
         "that mean the same thing but use different words. "
@@ -153,19 +166,20 @@ def expand_query(query: str) -> list[str]:
             temperature=0.4,
             max_tokens=200,
         )
-        raw = resp.choices[0].message.content.strip()
+        raw          = resp.choices[0].message.content.strip()
         alternatives = json.loads(raw)
         if isinstance(alternatives, list):
             return [query] + [str(a) for a in alternatives[:3]]
     except Exception:
         pass
-    return [query]  # fallback: just use original
+    return [query]
 
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 
 def _collection_has_points() -> bool:
     try:
+        ensure_collection()
         info = get_qdrant().get_collection(COLLECTION_NAME)
         return (info.points_count or 0) > 0
     except Exception:
@@ -173,13 +187,10 @@ def _collection_has_points() -> bool:
 
 
 def retrieve(query: str, limit: int = RETRIEVAL_CANDIDATES) -> list[dict]:
-    """
-    Multi-query retrieval: expand the query into variants, search each,
-    deduplicate results, and return top candidates ranked by best score.
-    """
+    """Multi-query retrieval with deduplication."""
+    ensure_collection()
     embedder = get_embedder()
     qdrant   = get_qdrant()
-
     queries  = expand_query(query)
     seen_ids = {}
 
@@ -192,16 +203,14 @@ def retrieve(query: str, limit: int = RETRIEVAL_CANDIDATES) -> list[dict]:
         )
         for r in results.points:
             rid = str(r.id)
-            # Keep the highest score if the same chunk appears in multiple queries
             if rid not in seen_ids or r.score > seen_ids[rid]["score"]:
                 seen_ids[rid] = {
-                    "id":    rid,
-                    "score": r.score,
-                    "text":  r.payload.get("text", ""),
+                    "id":     rid,
+                    "score":  r.score,
+                    "text":   r.payload.get("text", ""),
                     "source": r.payload.get("source_file", ""),
                 }
 
-    # Sort by score descending, return top candidates
     ranked = sorted(seen_ids.values(), key=lambda x: x["score"], reverse=True)
     return ranked[:limit]
 
@@ -209,15 +218,12 @@ def retrieve(query: str, limit: int = RETRIEVAL_CANDIDATES) -> list[dict]:
 # ── Context stitching ─────────────────────────────────────────────────────────
 
 def stitch_chunks(chunks: list[dict]) -> list[dict]:
-    """
-    Merge chunks that are from the same source and numerically adjacent.
-    This gives the LLM more coherent passages to reason over.
-    """
+    """Merge adjacent chunks from the same source for more coherent context."""
     if not chunks:
         return chunks
 
-    stitched  = []
-    used      = set()
+    stitched = []
+    used     = set()
 
     for i, chunk in enumerate(chunks):
         if i in used:
@@ -228,12 +234,9 @@ def stitch_chunks(chunks: list[dict]) -> list[dict]:
         for j, other in enumerate(chunks):
             if j in used or j == i:
                 continue
-            # Simple heuristic: if texts share significant overlap, merge them
             if chunk.get("source") == other.get("source"):
                 try:
-                    ci = int(chunk["id"])
-                    oj = int(other["id"])
-                    if abs(ci - oj) == 1:
+                    if abs(int(chunk["id"]) - int(other["id"])) == 1:
                         merged_text = merged_text + " " + other["text"]
                         used.add(j)
                 except (ValueError, KeyError):
@@ -247,19 +250,13 @@ def stitch_chunks(chunks: list[dict]) -> list[dict]:
 # ── LLM Reranking ─────────────────────────────────────────────────────────────
 
 def rerank_with_llm(query: str, chunks: list[dict]) -> list[dict]:
-    """
-    Ask LLaMA to score each chunk 0-10 for relevance to the query.
-    Combine with the vector score for a final weighted rank.
-    """
+    """Score chunks 0-10 for relevance, combine with vector score."""
     if not chunks:
         return []
 
     groq     = get_groq()
-    numbered = "\n".join(
-        f"[{i}] {c['text'][:400]}" for i, c in enumerate(chunks)
-    )
-
-    prompt = (
+    numbered = "\n".join(f"[{i}] {c['text'][:400]}" for i, c in enumerate(chunks))
+    prompt   = (
         f"You are a relevance judge. Score each chunk 0-10 for how well it answers "
         f"the query. 10 = directly answers, 0 = completely unrelated.\n\n"
         f"Query: {query}\n\n"
@@ -269,7 +266,7 @@ def rerank_with_llm(query: str, chunks: list[dict]) -> list[dict]:
     )
 
     try:
-        resp = groq.chat.completions.create(
+        resp   = groq.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
@@ -281,32 +278,24 @@ def rerank_with_llm(query: str, chunks: list[dict]) -> list[dict]:
         if not isinstance(scores, list) or len(scores) != len(chunks):
             raise ValueError("Score count mismatch")
     except Exception:
-        # Fallback: use vector scores only
         return sorted(chunks, key=lambda x: x["score"], reverse=True)[:FINAL_TOP_K]
 
-    # Weighted combination: 60% LLM score + 40% vector score
     for i, chunk in enumerate(chunks):
-        llm_score    = float(scores[i]) / 10.0          # normalize 0-1
+        llm_score    = float(scores[i]) / 10.0
         vector_score = float(chunk.get("score", 0))
         chunk["final_score"] = 0.6 * llm_score + 0.4 * vector_score
 
-    reranked = sorted(chunks, key=lambda x: x["final_score"], reverse=True)
-    return reranked[:FINAL_TOP_K]
+    return sorted(chunks, key=lambda x: x["final_score"], reverse=True)[:FINAL_TOP_K]
 
 
 # ── Answer generation — RAG mode ──────────────────────────────────────────────
 
 def generate_answer_from_docs(query: str, chunks: list[dict]) -> str:
-    """
-    Strict grounded answer. LLM must cite chunk IDs and cannot use
-    outside knowledge. Low temperature = more factual, less creative.
-    """
     groq    = get_groq()
     context = "\n\n".join(
         f"[CHUNK {i} | source: {c.get('source','?')}]\n{c['text']}"
         for i, c in enumerate(chunks)
     )
-
     prompt = (
         "You are a precise document Q&A assistant.\n"
         "Your job: answer the query using ONLY the document chunks below.\n\n"
@@ -323,12 +312,11 @@ def generate_answer_from_docs(query: str, chunks: list[dict]) -> str:
         f"=== QUERY ===\n{query}\n\n"
         "=== ANSWER ==="
     )
-
     response = groq.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=800,
-        temperature=0.1,   # very low = highly factual
+        temperature=0.1,
     )
     return response.choices[0].message.content.strip()
 
@@ -336,7 +324,6 @@ def generate_answer_from_docs(query: str, chunks: list[dict]) -> str:
 # ── Answer generation — General fallback ──────────────────────────────────────
 
 def generate_answer_general(query: str) -> str:
-    """Fallback — direct LLaMA answer with no document context."""
     groq   = get_groq()
     prompt = (
         "You are a knowledgeable and helpful AI assistant and expert programmer.\n"
@@ -363,7 +350,6 @@ def generate_answer_general(query: str) -> str:
 
 def phase3_pipeline(query: str, limit: int = RETRIEVAL_CANDIDATES) -> dict:
 
-    # Case 1: No documents uploaded
     if not _collection_has_points():
         print("[RAG] No documents — general fallback.")
         answer = generate_answer_general(query)
@@ -374,12 +360,10 @@ def phase3_pipeline(query: str, limit: int = RETRIEVAL_CANDIDATES) -> dict:
             "mode":       "general",
         }
 
-    # Case 2: Retrieve candidates
     print(f"[RAG] Multi-query retrieval (pool={limit})...")
-    chunks = retrieve(query, limit=limit)
-
-    # Case 3: Low confidence → fallback
+    chunks    = retrieve(query, limit=limit)
     top_score = chunks[0]["score"] if chunks else 0.0
+
     if not chunks or top_score < MIN_RELEVANCE_SCORE:
         print(f"[RAG] Low confidence (top={top_score:.2f}) — general fallback.")
         answer = generate_answer_general(query)
@@ -390,15 +374,12 @@ def phase3_pipeline(query: str, limit: int = RETRIEVAL_CANDIDATES) -> dict:
             "mode":       "general",
         }
 
-    # Case 4: Stitch adjacent chunks for coherence
     print("[RAG] Stitching adjacent chunks...")
     stitched = stitch_chunks(chunks)
 
-    # Case 5: LLM reranking
     print("[RAG] Reranking with LLM scores...")
     reranked = rerank_with_llm(query, stitched)
 
-    # Case 6: Generate grounded answer
     print("[RAG] Generating grounded answer...")
     answer = generate_answer_from_docs(query, reranked)
 
@@ -413,11 +394,11 @@ def phase3_pipeline(query: str, limit: int = RETRIEVAL_CANDIDATES) -> dict:
 # ── Upload helper ─────────────────────────────────────────────────────────────
 
 def add_file_to_rag(file_path: Path | str) -> None:
+    ensure_collection()
     file_path = Path(file_path)
     print(f"[UPLOAD] Indexing '{file_path.name}'...")
-    text   = read_uploaded_file(file_path)
-    chunks = split_text_into_chunks(text)
-
+    text     = read_uploaded_file(file_path)
+    chunks   = split_text_into_chunks(text)
     embedder = get_embedder()
     qdrant   = get_qdrant()
 
